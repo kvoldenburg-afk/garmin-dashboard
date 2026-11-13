@@ -66,6 +66,10 @@ export default function Dashboard() {
   const [dataOpen, setDataOpen] = useState(false);
   const [selected, setSelected] = useState<Activity | null>(null);
   const [autoSync, setAutoSync] = useState<"idle" | "running" | "done" | "error">("idle");
+  const [apiReady, setApiReady] = useState(false);
+  const [bannerPw, setBannerPw] = useState("");
+  const [bannerErr, setBannerErr] = useState<string | null>(null);
+  useEffect(() => { fetch("/api/garmin").then((r) => r.json()).then((j) => setApiReady(!!j.configured)).catch(() => {}); }, []);
 
   useEffect(() => {
     const d = load<DataSet>(LS_DATA);
@@ -110,12 +114,29 @@ export default function Dashboard() {
         </div>
       </header>
 
-      {data.source === "demo" && (
+      {data.source === "demo" && (apiReady ? (
+        <form className="banner" onSubmit={async (e) => {
+          e.preventDefault();
+          setBannerErr(null); setAutoSync("running");
+          try {
+            const j = await runSync(bannerPw, 365);
+            try { localStorage.setItem(LS_SECRET, bannerPw); } catch { /* private mode */ }
+            setData((d) => (d ? mergeSync(d, j) : d)); setAutoSync("done");
+          } catch (err) { setBannerErr((err as Error).message); setAutoSync("error"); }
+        }}>
+          <span><b>Your Garmin account is connected.</b> Enter your sync password once on this device to load your data — you&apos;re seeing demo data until then.</span>
+          <span style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <input className="search" style={{ minWidth: 180 }} type="password" placeholder="Sync password" value={bannerPw} onChange={(e) => setBannerPw(e.target.value)} autoComplete="current-password" />
+            <button className="btn primary" disabled={!bannerPw || autoSync === "running"}><IconSync size={16} />{autoSync === "running" ? "Syncing…" : "Load my data"}</button>
+          </span>
+          {bannerErr && <span style={{ width: "100%", color: "#ff8c8c", fontSize: 13 }}>{bannerErr}</span>}
+        </form>
+      ) : (
         <div className="banner">
           <span>You&apos;re viewing <b>demo data</b>. Import your Garmin Connect CSV or connect a live sync to see your own training.</span>
           <button className="btn primary" onClick={() => setDataOpen(true)}><IconUpload size={16} />Import my data</button>
         </div>
-      )}
+      ))}
 
       {tab !== "records" && (
         <div className="filters">
