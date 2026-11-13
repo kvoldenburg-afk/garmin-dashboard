@@ -1,4 +1,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
+/**
+ * Garmin Connect Personal API sync (official, read-only).
+ * Env: GARMIN_API_KEY (personal API key from connect.garmin.com/app/settings/personalApiToken)
+ *      SYNC_SECRET    (password the dashboard's Sync button must send)
+ */
 import { NextResponse } from "next/server";
 import { timingSafeEqual } from "node:crypto";
 import { toSport } from "@/lib/csv";
@@ -8,11 +13,10 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-const configured = () => !!(process.env.GARMIN_EMAIL && process.env.GARMIN_PASSWORD && process.env.SYNC_SECRET);
+const BASE = "https://personal.connectapi.garmin.com";
+const TOKEN_PATH = "/personalapitoken-service/personal-api/personal-api-key/token";
 
-export async function GET() {
-  return NextResponse.json({ configured: configured() });
-}
+const configured = () => !!(process.env.GARMIN_API_KEY && process.env.SYNC_SECRET);
 
 function safeEq(a: string, b: string) {
   const x = Buffer.from(a), y = Buffer.from(b);
@@ -21,6 +25,48 @@ function safeEq(a: string, b: string) {
 
 const p2 = (n: number) => String(n).padStart(2, "0");
 const ymd = (d: Date) => `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
+const addDays = (d: Date, n: number) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+
+/* ---------- auth (bearer tokens last 24h; cache per warm instance) ---------- */
+let cached: { token: string; exp: number } | null = null;
+async function bearer(): Promise<string> {
+  if (cached && cached.exp - Date.now() > 3600_000) return cached.token;
+  const r = await fetch(BASE + TOKEN_PATH, {
+    method: "POST",
+    headers: { Accept: "*/*", Authorization: `ApiKey ${process.env.GARMIN_API_KEY}` },
+    cache: "no-store",
+  });
+  if (!r.ok) throw new Error(`token request failed (${r.status}): ${(await r.text()).slice(0, 160)}`);
+  const token = (await r.text()).trim();
+  let exp = Date.now() + 23 * 3600_000;
+  try { exp = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString()).exp * 1000 || exp; } catch { /* opaque token */ }
+  cached = { token, exp };
+  return token;
+}
+
+async function gget(path: string, params?: Record<string, string | number | undefined>): Promise<any> {
+  const url = new URL(BASE + path);
+  Object.entries(params ?? {}).forEach(([k, v]) => v !== undefined && url.searchParams.set(k, String(v)));
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${await bearer()}`, Accept: "application/json" }, cache: "no-store" });
+  if (r.status === 204) return null;
+  if (!r.ok) throw new Error(`${path} → ${r.status}`);
+  const t = await r.text();
+  return t ? JSON.parse(t) : null;
+}
+
+/** Split [from,to] into windows of at most `max` days. */
+function windows(from: Date, to: Date, max: number) {
+  const out: [string, string][] = [];
+  for (let a = new Date(from); a <= to; a = addDays(a, max)) {
+    const b = addDays(a, max - 1);
+    out.push([ymd(a), ymd(b > to ? to : b)]);
+  }
+  return out;
+}
+
+const arr = (x: any): any[] => (Array.isArray(x) ? x : Array.isArray(x?.data) ? x.data : Array.isArray(x?.hrvSummaries) ? x.hrvSummaries
+  : Array.isArray(x?.dailySleepSummaries) ? x.dailySleepSummaries : Array.isArray(x?.values) ? x.values : []);
+const n = (...vals: any[]) => { for (const v of vals) if (typeof v === "number" && isFinite(v)) return v; return undefined; };
 
 function mapActivity(a: any): Activity {
   const typeKey: string = a.activityType?.typeKey ?? "other";
@@ -31,27 +77,47 @@ function mapActivity(a: any): Activity {
     title: a.activityName || typeKey,
     start: String(a.startTimeLocal).replace(" ", "T").slice(0, 19),
     distanceKm: (a.distance ?? 0) / 1000,
-    durationS: Math.round(a.duration ?? 0),
+    durationS: Math.round(a.duration ?? a.elapsedDuration ?? 0),
     movingS: a.movingDuration ? Math.round(a.movingDuration) : undefined,
     calories: a.calories ? Math.round(a.calories) : undefined,
     avgHr: a.averageHR ? Math.round(a.averageHR) : undefined,
     maxHr: a.maxHR ? Math.round(a.maxHR) : undefined,
     ascentM: a.elevationGain ? Math.round(a.elevationGain) : undefined,
     aerobicTE: a.aerobicTrainingEffect ?? undefined,
-    cadence: a.averageRunningCadenceInStepsPerMinute ? Math.round(a.averageRunningCadenceInStepsPerMinute) : undefined,
+    cadence: n(a.averageRunningCadenceInStepsPerMinute) ? Math.round(a.averageRunningCadenceInStepsPerMinute) : undefined,
     avgPower: a.avgPower ? Math.round(a.avgPower) : undefined,
     tss: a.trainingStressScore ?? undefined,
     steps: a.steps ?? undefined,
   };
 }
 
-async function pool<T, R>(items: T[], n: number, fn: (x: T) => Promise<R>) {
-  const out: R[] = [];
-  let i = 0;
-  await Promise.all(Array.from({ length: n }, async () => {
-    while (i < items.length) { const idx = i++; out[idx] = await fn(items[idx]); }
-  }));
-  return out;
+export async function GET(req: Request) {
+  const url = new URL(req.url);
+  // Diagnostic: /api/garmin?probe=<SYNC_SECRET> shows which endpoints respond and their shapes (no values).
+  const probe = url.searchParams.get("probe");
+  if (probe && configured() && safeEq(probe, process.env.SYNC_SECRET!)) {
+    const to = new Date(), from = addDays(to, -6);
+    const tests: Record<string, () => Promise<any>> = {
+      activities: () => gget("/activitylist-service/activities/search/activities", { start: 0, limit: 2 }),
+      dailySummaries: () => gget("/usersummary-service/v2/dailysummaries", { startDate: ymd(from), endDate: ymd(to) }),
+      sleepSummaries: () => gget("/sleep-service/sleep/dailySleepSummariesByDate", { startDate: ymd(from), endDate: ymd(to) }),
+      hrv: () => gget(`/hrv-service/hrv/daily/${ymd(from)}/${ymd(to)}`),
+      bodyBattery: () => gget("/wellness-service/wellness/bodyBattery/reports/daily", { startDate: ymd(from), endDate: ymd(to) }),
+      stress: () => gget(`/usersummary-service/stats/stress/daily/${ymd(from)}/${ymd(to)}`),
+      steps: () => gget(`/usersummary-service/stats/steps/daily/${ymd(from)}/${ymd(to)}`),
+    };
+    const shape = (x: any, depth = 0): any => {
+      if (Array.isArray(x)) return x.length ? [shape(x[0], depth + 1), `…${x.length}`] : [];
+      if (x && typeof x === "object") return depth > 3 ? "{…}" : Object.fromEntries(Object.entries(x).slice(0, 60).map(([k, v]) => [k, shape(v, depth + 1)]));
+      return typeof x;
+    };
+    const out: Record<string, any> = {};
+    for (const [k, f] of Object.entries(tests)) {
+      try { out[k] = shape(await f()); } catch (e) { out[k] = `ERROR ${(e as Error).message}`; }
+    }
+    return NextResponse.json(out);
+  }
+  return NextResponse.json({ configured: configured(), mode: "personal-api" });
 }
 
 export async function POST(req: Request) {
@@ -60,57 +126,93 @@ export async function POST(req: Request) {
   if (!safeEq(secret, process.env.SYNC_SECRET!)) return NextResponse.json({ error: "Wrong sync password." }, { status: 401 });
 
   const body = await req.json().catch(() => ({}));
-  const days = Math.min(90, Math.max(1, Number(body.days) || 30));
-  const limit = Math.min(1000, Math.max(10, Number(body.limit) || 400));
+  const days = Math.min(365, Math.max(7, Number(body.days) || 90));
+  const limit = Math.min(3000, Math.max(20, Number(body.limit) || 1000));
+  const warnings: string[] = [];
 
-  let gc: any;
-  try {
-    const { GarminConnect } = await import("garmin-connect");
-    gc = new GarminConnect({ username: process.env.GARMIN_EMAIL!, password: process.env.GARMIN_PASSWORD! });
-    await gc.login();
-  } catch (e) {
-    return NextResponse.json({ error: `Garmin login failed: ${(e as Error).message}. Check credentials; 2-step verification isn't supported.` }, { status: 502 });
+  try { await bearer(); } catch (e) {
+    return NextResponse.json({ error: `Garmin rejected the API key: ${(e as Error).message}. It may have expired — create a new one at connect.garmin.com/app/settings/personalApiToken.` }, { status: 502 });
   }
 
+  // ---- activities (paged) ----
+  const raw: any[] = [];
   try {
-    // Activities (paged)
-    const raw: any[] = [];
     for (let start = 0; start < limit; start += 100) {
-      const page = await gc.getActivities(start, Math.min(100, limit - start));
+      const page = arr(await gget("/activitylist-service/activities/search/activities", { start, limit: 100 }));
       raw.push(...page);
       if (page.length < 100) break;
     }
-    const activities = raw.map(mapActivity).sort((a, b) => a.start.localeCompare(b.start));
+  } catch (e) { warnings.push(`activities: ${(e as Error).message}`); }
+  const activities = raw.map(mapActivity).sort((a, b) => a.start.localeCompare(b.start));
 
-    // Daily wellness: sleep endpoint carries sleep, HRV, RHR, body battery & stress
-    const dates: Date[] = [];
-    for (let i = days - 1; i >= 0; i--) { const d = new Date(); d.setDate(d.getDate() - i); dates.push(d); }
-    const daily: DailyWellness[] = await pool(dates, 4, async (d) => {
-      const row: DailyWellness = { date: ymd(d) };
-      try {
-        const s: any = await gc.getSleepData(d);
-        const dto = s?.dailySleepDTO ?? {};
-        row.sleepS = dto.sleepTimeSeconds ?? undefined;
-        row.sleepScore = dto.sleepScores?.overall?.value ?? undefined;
-        row.hrv = s?.avgOvernightHrv ? Math.round(s.avgOvernightHrv) : undefined;
-        row.restingHr = s?.restingHeartRate ?? undefined;
-        row.stress = dto.avgSleepStress ? Math.round(dto.avgSleepStress) : undefined;
-        const bb: any[] = s?.sleepBodyBattery ?? [];
-        if (bb.length) row.bodyBattery = Math.max(...bb.map((x) => x.value ?? 0));
-      } catch { /* day without sleep data */ }
-      return row;
+  // ---- daily wellness ----
+  const to = new Date(), from = addDays(to, -(days - 1));
+  const daily = new Map<string, DailyWellness>();
+  const row = (date: string) => { let r = daily.get(date); if (!r) { r = { date }; daily.set(date, r); } return r; };
+  const safe = async (label: string, f: () => Promise<void>) => { try { await f(); } catch (e) { warnings.push(`${label}: ${(e as Error).message}`); } };
+
+  await Promise.all([
+    // v2 daily summaries: steps, resting HR, stress, body battery (≤ 1 year per call; use 28-day windows to be safe)
+    safe("daily summaries", async () => {
+      for (const [a, b] of windows(from, to, 28)) {
+        for (const d of arr(await gget("/usersummary-service/v2/dailysummaries", { startDate: a, endDate: b }))) {
+          if (!d?.calendarDate) continue;
+          const r = row(d.calendarDate);
+          r.steps = n(d.movement?.steps, d.totalSteps, r.steps);
+          r.restingHr = n(d.heartRate?.restingValue, d.restingHeartRate, r.restingHr);
+          r.stress = n(d.stress?.averageLevel, d.stress?.avgLevel, d.stress?.overallLevel, d.averageStressLevel, r.stress);
+          r.bodyBattery = n(d.bodyBattery?.highestValue, d.bodyBattery?.maxValue, d.bodyBattery?.highest, d.bodyBatteryHighestValue, r.bodyBattery);
+        }
+      }
+    }),
+    // sleep (≤ 31 days per call)
+    safe("sleep", async () => {
+      for (const [a, b] of windows(from, to, 31)) {
+        for (const s of arr(await gget("/sleep-service/sleep/dailySleepSummariesByDate", { startDate: a, endDate: b }))) {
+          const dto = s?.dailySleepDTO ?? s;
+          const date = dto?.calendarDate;
+          if (!date) continue;
+          const r = row(date);
+          r.sleepS = n(dto.sleepTimeSeconds, dto.sleepTimeInSeconds, dto.totalSleepSeconds, r.sleepS);
+          r.sleepScore = n(dto.sleepScores?.overall?.value, dto.sleepScore, dto.overallSleepScore?.value, dto.overallSleepScore, r.sleepScore);
+          r.restingHr = n(r.restingHr, s.restingHeartRate);
+          r.hrv = n(r.hrv, s.avgOvernightHrv);
+        }
+      }
+    }),
+    // HRV (28-day windows)
+    safe("hrv", async () => {
+      for (const [a, b] of windows(from, to, 28)) {
+        for (const h of arr(await gget(`/hrv-service/hrv/daily/${a}/${b}`))) {
+          if (h?.calendarDate) row(h.calendarDate).hrv = n(h.lastNightAvg, h.weeklyAvg);
+        }
+      }
+    }),
+    // Body battery reports (fallback for the daily peak)
+    safe("body battery", async () => {
+      for (const [a, b] of windows(from, to, 28)) {
+        for (const d of arr(await gget("/wellness-service/wellness/bodyBattery/reports/daily", { startDate: a, endDate: b }))) {
+          const date = d?.date ?? d?.calendarDate;
+          const vals: any[] = d?.bodyBatteryValuesArray ?? [];
+          if (date && vals.length) { const r = row(date); r.bodyBattery = n(r.bodyBattery, Math.max(...vals.map((v) => (Array.isArray(v) ? v[1] : 0) ?? 0))); }
+        }
+      }
+    }),
+  ]);
+
+  // Steps fallback (stats endpoint, ≤ 28 days)
+  if (![...daily.values()].some((d) => d.steps)) {
+    await safe("steps", async () => {
+      for (const [a, b] of windows(from, to, 28)) {
+        for (const s of arr(await gget(`/usersummary-service/stats/steps/daily/${a}/${b}`))) {
+          if (s?.calendarDate) row(s.calendarDate).steps = n(s.totalSteps, s.steps, s.values?.totalSteps);
+        }
+      }
     });
-
-    // Steps for the whole window in one call
-    try {
-      const url = `${gc.url.GC_API}/usersummary-service/stats/steps/daily/${ymd(dates[0])}/${ymd(dates[dates.length - 1])}`;
-      const steps: any[] = await gc.get(url);
-      const map = new Map(daily.map((d) => [d.date, d]));
-      steps?.forEach((s) => { const r = map.get(s.calendarDate); if (r) r.steps = s.totalSteps; });
-    } catch { /* steps optional */ }
-
-    return NextResponse.json({ activities, daily });
-  } catch (e) {
-    return NextResponse.json({ error: `Garmin request failed: ${(e as Error).message}` }, { status: 502 });
   }
+
+  const dailyOut = [...daily.values()]
+    .filter((d) => Object.keys(d).length > 1)
+    .sort((a, b) => a.date.localeCompare(b.date));
+  return NextResponse.json({ activities, daily: dailyOut, warnings });
 }

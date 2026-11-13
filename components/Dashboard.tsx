@@ -26,6 +26,24 @@ const LS_SETTINGS = "pulse.settings.v1";
 const LS_SECRET = "pulse.syncSecret";
 const DEFAULT_SETTINGS: Settings = { units: "km", yearlyGoalKm: 2000, goalSport: "all" };
 
+function mergeSync(data: DataSet, j: { activities: Activity[]; daily: DailyWellness[] }): DataSet {
+  const key = (a: Activity) => `${a.start.slice(0, 16)}|${a.sport}`;
+  const fresh = new Set(j.activities.map(key));
+  const base = data.source === "demo" ? [] : data.activities.filter((a) => !fresh.has(key(a)));
+  const activities = [...base, ...j.activities].sort((x, y) => x.start.localeCompare(y.start));
+  const dmap = new Map((data.source === "demo" ? [] : data.daily).map((d) => [d.date, d]));
+  j.daily.forEach((d) => dmap.set(d.date, { ...dmap.get(d.date), ...d }));
+  const daily = [...dmap.values()].sort((x, y) => x.date.localeCompare(y.date));
+  return { source: "garmin", updatedAt: new Date().toISOString(), activities, daily };
+}
+
+async function runSync(secret: string, days: number) {
+  const r = await fetch("/api/garmin", { method: "POST", headers: { "content-type": "application/json", "x-sync-secret": secret }, body: JSON.stringify({ days }) });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || `Sync failed (${r.status})`);
+  return j as { activities: Activity[]; daily: DailyWellness[]; warnings?: string[] };
+}
+
 function load<T>(k: string): T | undefined {
   try { const v = localStorage.getItem(k); return v ? (JSON.parse(v) as T) : undefined; } catch { return undefined; }
 }
@@ -41,6 +59,7 @@ export default function Dashboard() {
   const [sport, setSport] = useState<Sport | "all">("all");
   const [dataOpen, setDataOpen] = useState(false);
   const [selected, setSelected] = useState<Activity | null>(null);
+  const [autoSync, setAutoSync] = useState<"idle" | "running" | "done" | "error">("idle");
 
   useEffect(() => {
     const d = load<DataSet>(LS_DATA);
@@ -50,6 +69,16 @@ export default function Dashboard() {
     if (["overview", "training", "activities", "health", "records"].includes(t)) setTab(t);
   }, []);
   useEffect(() => { if (data && data.source !== "demo") save(LS_DATA, data); }, [data]);
+  // Background refresh: once a sync password is saved, pull new Garmin data whenever the app opens (max every 30 min).
+  useEffect(() => {
+    if (!data || autoSync !== "idle") return;
+    const secret = (() => { try { return localStorage.getItem(LS_SECRET); } catch { return null; } })();
+    if (!secret || (data.source === "garmin" && Date.now() - new Date(data.updatedAt).getTime() < 30 * 60_000)) return;
+    setAutoSync("running");
+    runSync(secret, data.source === "garmin" ? 14 : 180)
+      .then((j) => { setData((d) => (d ? mergeSync(d, j) : d)); setAutoSync("done"); })
+      .catch(() => setAutoSync("error"));
+  }, [data, autoSync]);
   useEffect(() => { save(LS_SETTINGS, settings); }, [settings]);
   const go = (t: Tab) => { setTab(t); history.replaceState(null, "", `#${t}`); window.scrollTo({ top: 0 }); };
 
@@ -68,6 +97,7 @@ export default function Dashboard() {
           ))}
         </nav>
         <div className="top-actions">
+          {autoSync === "running" && <span className="source-pill"><IconSync size={13} />Syncing…</span>}
           <span className="source-pill hide-sm"><i className="dot" style={{ background: data.source === "demo" ? "#c98500" : "#0ca30c" }} />
             {data.source === "demo" ? "Demo data" : data.source === "csv" ? "CSV import" : "Garmin sync"} · {fmtInt(data.activities.length)} activities</span>
           <button className="btn primary" onClick={() => setDataOpen(true)}><IconUpload size={16} /><span className="hide-sm">Data & settings</span></button>
@@ -422,7 +452,7 @@ function Health({ dailyRange, openData, data }: Ctx) {
       <div className="card empty">
         <IconHeart size={32} />
         <h3>No daily health data yet</h3>
-        <p>Garmin&apos;s activity CSV doesn&apos;t include sleep, HRV, resting HR or steps. Connect the Garmin sync to fill this page.</p>
+        <p>Garmin&apos;s activity CSV doesn&apos;t include sleep, HRV, resting HR or steps. Sync with the Garmin Personal API to fill this page.</p>
         <button className="btn primary" onClick={openData}><IconSync size={16} />Set up Garmin sync</button>
       </div>
     );
@@ -574,7 +604,7 @@ function DataModal({ data, setData, settings, setSettings, onClose }: {
   const [api, setApi] = useState<{ configured: boolean } | null>(null);
   const [secret, setSecret] = useState("");
   const [syncing, setSyncing] = useState(false);
-  const [days, setDays] = useState(30);
+  const [days, setDays] = useState(180);
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -614,19 +644,9 @@ function DataModal({ data, setData, settings, setSettings, onClose }: {
     setSyncing(true); setMsg(null);
     try {
       localStorage.setItem(LS_SECRET, secret);
-      const r = await fetch("/api/garmin", { method: "POST", headers: { "content-type": "application/json", "x-sync-secret": secret }, body: JSON.stringify({ days }) });
-      const j = await r.json();
-      if (!r.ok) throw new Error(j.error || `Sync failed (${r.status})`);
-      const incoming = j.activities as Activity[];
-      const key = (a: Activity) => `${a.start.slice(0, 16)}|${a.sport}`;
-      const fresh = new Set(incoming.map(key));
-      const base = data.source === "demo" ? [] : data.activities.filter((a) => !fresh.has(key(a)));
-      const activities = [...base, ...incoming].sort((x, y) => x.start.localeCompare(y.start));
-      const dmap = new Map((data.source === "demo" ? [] : data.daily).map((d) => [d.date, d]));
-      (j.daily as DailyWellness[]).forEach((d) => dmap.set(d.date, { ...dmap.get(d.date), ...d }));
-      const daily = [...dmap.values()].sort((x, y) => x.date.localeCompare(y.date));
-      setData({ source: "garmin", updatedAt: new Date().toISOString(), activities, daily });
-      setMsg({ ok: true, text: `Synced ${incoming.length} activities and ${j.daily.length} days of health data.` });
+      const j = await runSync(secret, days);
+      setData(mergeSync(data, j));
+      setMsg({ ok: j.activities.length > 0 || j.daily.length > 0, text: `Synced ${j.activities.length} activities and ${j.daily.length} days of health data.${j.warnings?.length ? ` Some data was unavailable: ${j.warnings.join("; ")}` : ""}` });
     } catch (e) {
       setMsg({ ok: false, text: (e as Error).message });
     } finally { setSyncing(false); }
@@ -682,18 +702,17 @@ function DataModal({ data, setData, settings, setSettings, onClose }: {
             <>
               <div className="fields">
                 <label className="field">Sync password<input type="password" value={secret} onChange={(e) => setSecret(e.target.value)} placeholder="SYNC_SECRET" /></label>
-                <label className="field">Health days to fetch<select value={days} onChange={(e) => setDays(+e.target.value)}>{[7, 14, 30, 60].map((d) => <option key={d} value={d}>{d} days</option>)}</select></label>
+                <label className="field">Health days to fetch<select value={days} onChange={(e) => setDays(+e.target.value)}>{[30, 90, 180, 365].map((d) => <option key={d} value={d}>{d === 365 ? "1 year" : `${d} days`}</option>)}</select></label>
               </div>
               <button className="btn primary" style={{ marginTop: 12, width: "100%", justifyContent: "center" }} disabled={syncing || !secret} onClick={sync}>
                 <IconSync size={16} />{syncing ? "Syncing with Garmin… (up to a minute)" : "Sync now"}
               </button>
-              <div className="note" style={{ marginTop: 8 }}>Pulls your latest activities plus sleep, HRV, resting HR, Body Battery, stress and steps.</div>
+              <div className="note" style={{ marginTop: 8 }}>Uses Garmin&apos;s official Personal API: all your activities plus sleep, HRV, resting HR, Body Battery, stress and steps. After the first sync, new data is pulled automatically whenever you open the dashboard on this device.</div>
             </>
           ) : (
             <div className="note">
-              Not configured on this deployment. In Vercel → Project → Settings → Environment Variables add
-              <code> GARMIN_EMAIL</code>, <code>GARMIN_PASSWORD</code> and <code>SYNC_SECRET</code>, then redeploy.
-              Uses Garmin Connect&apos;s unofficial login (accounts with 2-step verification aren&apos;t supported).
+              Not configured yet. Create a Personal API key at connect.garmin.com → Settings → Personal API, then in Vercel → Project →
+              Settings → Environment Variables add <code>GARMIN_API_KEY</code> and <code>SYNC_SECRET</code> (any password) and redeploy.
             </div>
           )}
         </div>

@@ -17,12 +17,11 @@ Filters: date range (30D/90D/6M/1Y/All) × sport. Units: km or mi.
 ## Data sources
 
 1. **Garmin Connect CSV.** On connect.garmin.com, open Activities → All Activities, scroll to the bottom so every activity loads, then click Export CSV. Import the file from **Data & settings**. English and German exports work, including decimal commas. Data stays in your browser's localStorage.
-2. **Live Garmin sync (optional).** Set these environment variables in Vercel, then redeploy:
-   - `GARMIN_EMAIL`: your Garmin Connect login
-   - `GARMIN_PASSWORD`: your Garmin Connect password
-   - `SYNC_SECRET`: any password you choose. The sync button asks for it, so nobody else can run a sync on your deployment.
+2. **Live Garmin sync (official Garmin Connect Personal API).** Create a key at connect.garmin.com → Settings → Personal API (`/app/settings/personalApiToken`). Then add these in Vercel → Settings → Environment Variables and redeploy:
+   - `GARMIN_API_KEY`: the personal API key
+   - `SYNC_SECRET`: any password you choose. The dashboard asks for it once per device, so strangers can't trigger a sync.
 
-   The sync pulls up to 400 recent activities plus 7–60 days of sleep, HRV, RHR, Body Battery, stress and steps. It uses the unofficial [`garmin-connect`](https://github.com/Pythe1337N/garmin-connect) library. Accounts with 2-step verification aren't supported, and Garmin may change its login without notice.
+   The sync pulls all your activities plus up to a year of sleep, HRV, resting HR, Body Battery, stress and steps. After the first sync it refreshes automatically when you open the app. Keys expire after 30 days to 1 year (Garmin emails you before that), so replace `GARMIN_API_KEY` when yours does.
 3. **Demo data.** About two years of generated activities load until you import your own.
 
 Backups: Data & settings → Download backup (JSON). Restore it by importing the .json file.
