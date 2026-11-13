@@ -136,7 +136,7 @@ export async function POST(req: Request) {
           r.steps = n(d.movement?.steps?.value, d.movement?.steps?.count, d.movement?.steps?.total, d.totalSteps, r.steps);
           r.restingHr = n(d.heartRate?.restingValue, d.restingHeartRate, r.restingHr);
           r.stress = n(d.stress?.avgLevel, d.stress?.averageLevel, d.stress?.overallLevel, d.averageStressLevel, r.stress);
-          r.bodyBattery = n(d.bodyBattery?.highestValue, d.bodyBattery?.maxValue, d.bodyBattery?.highest, d.bodyBatteryHighestValue, r.bodyBattery);
+          r.bodyBattery = n(d.bodyBattery?.maxValue || undefined, d.bodyBattery?.highestValue || undefined, d.bodyBatteryHighestValue || undefined, r.bodyBattery);
         }
       }
     }),
@@ -169,7 +169,8 @@ export async function POST(req: Request) {
         for (const d of arr(await gget("/wellness-service/wellness/bodyBattery/reports/daily", { startDate: a, endDate: b }))) {
           const date = d?.date ?? d?.calendarDate;
           const vals: any[] = d?.bodyBatteryValuesArray ?? [];
-          if (date && vals.length) { const r = row(date); r.bodyBattery = n(r.bodyBattery, Math.max(...vals.map((v) => (Array.isArray(v) ? v[1] : 0) ?? 0))); }
+          const peak = vals.length ? Math.max(...vals.map((v) => (Array.isArray(v) && typeof v[1] === "number" ? v[1] : 0))) : 0;
+          if (date && peak > 0) { const r = row(date); r.bodyBattery = n(r.bodyBattery, peak); }
         }
       }
     }),

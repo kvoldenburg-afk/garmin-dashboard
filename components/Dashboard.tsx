@@ -33,7 +33,13 @@ function mergeSync(data: DataSet, j: { activities: Activity[]; daily: DailyWelln
   const activities = [...base, ...j.activities].sort((x, y) => x.start.localeCompare(y.start));
   const dmap = new Map((data.source === "demo" ? [] : data.daily).map((d) => [d.date, d]));
   j.daily.forEach((d) => dmap.set(d.date, { ...dmap.get(d.date), ...d }));
-  const daily = [...dmap.values()].sort((x, y) => x.date.localeCompare(y.date));
+  // zero readings are "no data" (days before the watch was worn), not real values
+  const clean = (d: DailyWellness) => {
+    const o: DailyWellness = { date: d.date };
+    (Object.keys(d) as (keyof DailyWellness)[]).forEach((k) => { const v = d[k]; if (k !== "date" && typeof v === "number" && v > 0) (o as any)[k] = v; });
+    return o;
+  };
+  const daily = [...dmap.values()].map(clean).filter((d) => Object.keys(d).length > 1).sort((x, y) => x.date.localeCompare(y.date));
   return { source: "garmin", updatedAt: new Date().toISOString(), activities, daily };
 }
 
