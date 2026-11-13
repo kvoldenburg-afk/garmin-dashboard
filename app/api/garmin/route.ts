@@ -91,32 +91,7 @@ function mapActivity(a: any): Activity {
   };
 }
 
-export async function GET(req: Request) {
-  const url = new URL(req.url);
-  // Diagnostic: /api/garmin?probe=<SYNC_SECRET> shows which endpoints respond and their shapes (no values).
-  const probe = url.searchParams.get("probe");
-  if (probe && configured() && safeEq(probe, process.env.SYNC_SECRET!)) {
-    const to = new Date(), from = addDays(to, -6);
-    const tests: Record<string, () => Promise<any>> = {
-      activities: () => gget("/activitylist-service/activities/search/activities", { start: 0, limit: 2 }),
-      dailySummaries: () => gget("/usersummary-service/v2/dailysummaries", { startDate: ymd(from), endDate: ymd(to) }),
-      sleepSummaries: () => gget("/sleep-service/sleep/dailySleepSummariesByDate", { startDate: ymd(from), endDate: ymd(to) }),
-      hrv: () => gget(`/hrv-service/hrv/daily/${ymd(from)}/${ymd(to)}`),
-      bodyBattery: () => gget("/wellness-service/wellness/bodyBattery/reports/daily", { startDate: ymd(from), endDate: ymd(to) }),
-      stress: () => gget(`/usersummary-service/stats/stress/daily/${ymd(from)}/${ymd(to)}`),
-      steps: () => gget(`/usersummary-service/stats/steps/daily/${ymd(from)}/${ymd(to)}`),
-    };
-    const shape = (x: any, depth = 0): any => {
-      if (Array.isArray(x)) return x.length ? [shape(x[0], depth + 1), `…${x.length}`] : [];
-      if (x && typeof x === "object") return depth > 3 ? "{…}" : Object.fromEntries(Object.entries(x).slice(0, 60).map(([k, v]) => [k, shape(v, depth + 1)]));
-      return typeof x;
-    };
-    const out: Record<string, any> = {};
-    for (const [k, f] of Object.entries(tests)) {
-      try { out[k] = shape(await f()); } catch (e) { out[k] = `ERROR ${(e as Error).message}`; }
-    }
-    return NextResponse.json(out);
-  }
+export async function GET() {
   return NextResponse.json({ configured: configured(), mode: "personal-api" });
 }
 
@@ -158,9 +133,9 @@ export async function POST(req: Request) {
         for (const d of arr(await gget("/usersummary-service/v2/dailysummaries", { startDate: a, endDate: b }))) {
           if (!d?.calendarDate) continue;
           const r = row(d.calendarDate);
-          r.steps = n(d.movement?.steps, d.totalSteps, r.steps);
+          r.steps = n(d.movement?.steps?.value, d.movement?.steps?.count, d.movement?.steps?.total, d.totalSteps, r.steps);
           r.restingHr = n(d.heartRate?.restingValue, d.restingHeartRate, r.restingHr);
-          r.stress = n(d.stress?.averageLevel, d.stress?.avgLevel, d.stress?.overallLevel, d.averageStressLevel, r.stress);
+          r.stress = n(d.stress?.avgLevel, d.stress?.averageLevel, d.stress?.overallLevel, d.averageStressLevel, r.stress);
           r.bodyBattery = n(d.bodyBattery?.highestValue, d.bodyBattery?.maxValue, d.bodyBattery?.highest, d.bodyBatteryHighestValue, r.bodyBattery);
         }
       }
@@ -200,12 +175,12 @@ export async function POST(req: Request) {
     }),
   ]);
 
-  // Steps fallback (stats endpoint, ≤ 28 days)
-  if (![...daily.values()].some((d) => d.steps)) {
+  // Steps (stats endpoint, ≤ 28 days per call) — authoritative daily totals
+  {
     await safe("steps", async () => {
       for (const [a, b] of windows(from, to, 28)) {
         for (const s of arr(await gget(`/usersummary-service/stats/steps/daily/${a}/${b}`))) {
-          if (s?.calendarDate) row(s.calendarDate).steps = n(s.totalSteps, s.steps, s.values?.totalSteps);
+          if (s?.calendarDate) { const v = n(s.totalSteps, s.values?.totalSteps); if (v !== undefined) row(s.calendarDate).steps = v; }
         }
       }
     });
